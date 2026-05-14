@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin wrapper for netcore_lldb.py that finds Python and invokes the script.
+# Put this on PATH and configure it as the `command` in Claude Code's .mcp.json.
+set -eu
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$HERE/netcore_lldb.py" "$@"
