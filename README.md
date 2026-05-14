@@ -43,50 +43,44 @@ Requirements on your laptop:
 - `docker` on PATH if you'll connect via Docker; `ssh` + `scp` on PATH for SSH.
 - Claude Code (or any MCP client that supports stdio servers).
 
-### Step 2 — Locate your four inputs (1 minute)
+### Step 2 — Locate your three inputs (1 minute)
 
-Before configuring anything, write down four things. Then Step 3 is just
-fill-in-the-blank.
+The headline case is: **your .NET app crashed in a container, and the dump
+is right there in the same container**. In that case you only need to tell
+us three things.
 
-#### 1. **The dump file** — where does it live?
+#### 1. **The dump file** — where does it live on the target?
 
 | Where is the dump? | What you'll use |
 |---|---|
-| Inside a Docker container running on **this laptop** (`docker ps` shows it) | `--docker <container-name>` + `--dump </path/inside/container>` |
+| Inside a Docker container running on **this laptop** | `--docker <container-name>` + `--dump </path/inside/container>` |
 | On a Linux **server** you can `ssh` into | `--ssh user@host` + `--dump </path/on/server>` |
-| On **your laptop**, want to copy it into a running container | `--docker <container>` + `--copy-dump --dump </local/path>` |
-| On **your laptop**, want to copy it to an SSH server | `--ssh user@host` + `--copy-dump --dump </local/path>` |
+| On **your laptop**, you'll copy it into a separate analysis target | See *"Analyzing a dump captured elsewhere"* below |
 
 If you haven't captured a dump yet, see *"How to capture a dump on crash"*
 below.
 
-#### 2. **The main executable** — where on the target is the app's native host?
+> **You do NOT need to tell us where the executable is.** When you point at
+> the container/server where your app runs, the executable is already at the
+> path the dump expects — lldb auto-loads it. The `--exec` flag exists for
+> the unusual case where you're analyzing the dump on a *different* machine;
+> see the flag reference.
 
-For a normal `dotnet publish` of MyApp, this is the file called just `MyApp`
-(no extension) next to `MyApp.dll`. Typical paths inside a container:
+#### 2. **Symbols (PDB files)** — where are they?
 
-- `/app/MyApp` (Microsoft Docker images)
-- `/opt/myapp/MyApp` (your own install)
-- `/work/app/MyApp` (after `docker cp` of a publish dir)
-
-You'll pass it as `--exec </path/inside/target>`. *Strictly optional* but
-strongly recommended — it helps lldb populate its module list.
-
-#### 3. **Symbols (PDB files)** — where are they?
-
-PDBs are how Claude gets to say *"this crashed at Program.cs line 33"* instead
-of just *"this crashed in Program.Main+0x21b"*.
+PDBs are how Claude gets to say *"this crashed at Program.cs line 33"*
+instead of just *"this crashed in Program.Main+0x21b"*.
 
 | State | What happens |
 |---|---|
 | **PDBs next to your DLLs on the target** (the default `dotnet publish` layout) | ✅ Claude gets source file + line numbers |
 | **PDBs missing on the target** | ⚠️ Claude still gets method names and IL offsets — useful, just less precise. No errors, no broken workflow. |
-| **PDBs locally but not on target** | Copy them in: `docker cp ./publish/. my-container:/app/` (re-runs of `--bootstrap` won't touch them) |
+| **PDBs locally but not on target** | Copy them in: `docker cp ./publish/. my-container:/app/` |
 
 You **don't need a CLI flag for symbols** — lldb/SOS auto-discovers them as
 long as each `.pdb` sits next to its `.dll`.
 
-#### 4. **Source code** — where on your laptop?
+#### 3. **Source code** — where on your laptop?
 
 You don't tell the tool. You tell Claude Code: just open Claude Code in your
 project's source directory. When SOS reports `Program.cs @ 33`, Claude Code
@@ -96,7 +90,7 @@ machine.
 ### Step 3 — Configure Claude Code (30 seconds)
 
 Open the `.mcp.json` file in your project (create it if it doesn't exist) and
-paste this. Replace the four `<...>` placeholders with the values from Step 2.
+paste this. Replace the two `<...>` placeholders with the values from Step 2.
 
 ```jsonc
 {
@@ -106,8 +100,7 @@ paste this. Replace the four `<...>` placeholders with the values from Step 2.
       "args": [
         "--docker",    "<your-container-name>",
         "--bootstrap",
-        "--dump",      "<path-to-dump-inside-container>",
-        "--exec",      "<path-to-your-app-binary-inside-container>"
+        "--dump",      "<path-to-dump-inside-container>"
       ]
     }
   }
@@ -131,8 +124,7 @@ runs it verifies in ~4 seconds and does nothing else.
       "args": [
         "--docker",    "checkout-service",
         "--bootstrap",
-        "--dump",      "/var/dumps/crash.core",
-        "--exec",      "/app/CheckoutService"
+        "--dump",      "/var/dumps/crash.core"
       ]
     }
   }
@@ -195,6 +187,39 @@ slightly less precise locations:
 
 ---
 
+## Analyzing a dump captured elsewhere
+
+When the crash happened in container/host A but you want to analyze it on
+container/host B (e.g., you can't add tools to your prod container), you
+need to bring three things over to B, not just the dump:
+
+```bash
+# 1. The dump file
+docker cp prod-container:/var/dumps/crash.core ./crash.core
+
+# 2. Your app's published binaries (they were at /app on the source — lldb
+#    on B will look at the same path the dump recorded)
+docker cp prod-container:/app ./app
+
+# 3. Push them into B
+docker cp ./crash.core analysis-container:/work/dump.core
+docker cp ./app/.       analysis-container:/work/app/
+```
+
+Then point the client at B with `--exec` so lldb knows where to find the
+(now-relocated) main executable:
+
+```jsonc
+"args": [
+  "--docker",    "analysis-container",
+  "--bootstrap",
+  "--dump",      "/work/dump.core",
+  "--exec",      "/work/app/CheckoutService"
+]
+```
+
+This is the only scenario where `--exec` is actually required.
+
 ## How to capture a dump on crash
 
 If your app isn't already configured to write a dump when it crashes, set
@@ -218,13 +243,13 @@ For a Kubernetes-deployed app, add these to your `Deployment.spec.template.spec.
 
 | Flag | Purpose | When to use |
 |---|---|---|
-| `--docker <CONTAINER>` | Connect via `docker exec` | When the dump is in a local container |
-| `--ssh <[USER@]HOST>` | Connect via SSH | When the dump is on a remote server |
+| `--docker <CONTAINER>` | Connect via `docker exec` | Dump is in a local Docker container |
+| `--ssh <[USER@]HOST>` | Connect via SSH | Dump is on a remote server |
 | `--dump <PATH>` | Path to the dump **inside the target** | Always required |
-| `--exec <PATH>` | Path to the main executable **inside the target** | Strongly recommended — helps lldb populate modules |
-| `--bootstrap` | Install lldb + SOS on the target if missing. Idempotent — safe to leave on. | First run on any new target |
+| `--bootstrap` | Install lldb + SOS on the target if missing. Idempotent. | First run on any new target — safe to leave on always |
 | `--copy-dump` | Treat `--dump` as a path on **your laptop**; copy it into the target before debugging | When the dump isn't already on the target |
-| `--target-dump-path <PATH>` | Where to put the copied dump (default `/tmp/netcore-lldb-dump-<pid>.core`) | With `--copy-dump`, if you want to control the destination |
+| `--target-dump-path <PATH>` | Destination on the target when `--copy-dump` is set (default `/tmp/netcore-lldb-dump-<pid>.core`) | Optional companion to `--copy-dump` |
+| `--exec <PATH>` | Path to the main executable **inside the target** | **Only needed when the target is *not* the original crash environment** — e.g. you copied the dump to a separate analysis container. In the natural flow (point at your app's container), lldb auto-loads the executable from the dump's recorded path. |
 
 ---
 
@@ -273,6 +298,7 @@ issues, high CPU, finalizer problems, and async-stuck scenarios.
 | `error: target ... does not have lldb installed` | Target missing lldb and you didn't pass `--bootstrap` | Re-run with `--bootstrap` |
 | `bootstrap: package install failed` | Target is non-root without passwordless sudo, or no internet | Install lldb manually (`apt install lldb`), or run the client from a privileged context, or use a target with internet |
 | `bootstrap: ... dotnet not found on target` | Target lacks `dotnet` (rare — usually your .NET app's container has it) | Install the .NET runtime or SDK on the target before `--bootstrap` |
+| `the target has no associated executable images` (then SOS failures) | You're analyzing the dump on a target that doesn't have your app's binary at the dump-recorded path | Either run the analysis in the container where the app actually runs (the natural flow), or copy the binaries over and add `--exec /path/to/binary` |
 | `Failed to find runtime module (libcoreclr.so)` from SOS commands | Target's .NET install path doesn't match what the dump expects | Make sure the target IS the same environment where the crash happened, OR bind-mount the matching `/usr/lib/dotnet` into the target |
 | `clrstack` shows method names but no file/line | PDBs aren't on the target next to the DLLs | Copy your `publish/` output into the target, e.g. `docker cp ./publish/. my-container:/app/` |
 | `gcroot` returns "tool raised: target process exited" | Known .NET 10 DAC bug — `gcroot` segfaults `libmscordaccore.so` on some dumps | The session keeps working; tell Claude to use heap-stat-based reasoning (`dumpheap -stat`, `dumpheap -type X`) instead |
