@@ -41,143 +41,262 @@ import traceback
 from dataclasses import dataclass
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "netcore-lldb", "version": "0.2.0"}
+SERVER_INFO = {"name": "netcore-lldb", "version": "0.3.0"}
 
+# Slim initialize instructions. Detail lives in resources/playbooks/* and
+# heuristics/known-issues resources — the LLM pulls only what's relevant.
 INSTRUCTIONS = """\
-You are connected to an lldb + SOS session inside a remote Linux container or
-machine, debugging a .NET core dump. Use the `lldb_command` tool to issue
-commands; the session is stateful (`thread select N` carries to subsequent
-calls). Playbooks below distill techniques from Tess Ferrandez's .NET
-debugging labs (the canonical reference for managed dump analysis).
+You are connected to an lldb + SOS session against a .NET Linux core dump.
+Use `lldb_command` to drive lldb; the session is stateful (`thread select N`
+carries to subsequent calls).
 
-== ORIENTATION (always run these first) ==
-  1. `eeversion`     — confirm runtime version. If "Failed to find runtime
-                        module" → the target's .NET install doesn't match the
-                        dump. Use `target_info` to diagnose; ask the user.
-  2. `clrthreads`    — managed thread list. The rightmost "Exception" column
-                        flags any thread with a pending exception (usually the
-                        faulting thread for crashes). Note the DBG id.
-  3. Decide the scenario from clrthreads + the user's complaint, then pick
-     the matching playbook below.
+Quick start:
+  1. Read `netcore-lldb://session` for transport/lldb/dump details.
+  2. Pick a playbook resource matching the symptom and read it:
+       Crash / unhandled exception:  netcore-lldb://playbook/crash
+       Memory / leak / OOM:          netcore-lldb://playbook/memory
+       Hang / deadlock:              netcore-lldb://playbook/hang
+       High CPU:                     netcore-lldb://playbook/high-cpu
+       Finalizer issue:              netcore-lldb://playbook/finalizer
+       Async / Task stuck:           netcore-lldb://playbook/async
+  3. Follow its sequence with `lldb_command`, then explain findings in chat
+     with file:line citations (from `clrstack`) where possible.
 
-== PLAYBOOK: unhandled exception / crash ==
-  - `thread select <DBG-id-with-Exception>`
-  - `pe -nested`             — exception type + message + inner exceptions
-  - `clrstack -a`            — managed stack with locals/parameters
-  - Read the source at the top frame's file:line and explain the failure path.
+The playbooks distill techniques from Tess Ferrandez's .NET debugging labs.
+Two extra reference resources:
+  netcore-lldb://heuristics    — Tess-named tells (the 80% rule, 100:10:1 GC
+                                 ratio, MonitorHeld, etc.)
+  netcore-lldb://known-issues  — workarounds for .NET 10 SOS bugs (notably
+                                 gcroot crashing libmscordaccore.so)
 
-== PLAYBOOK: memory issue (high RSS / suspected leak) ==
-  - `eeheap -gc`             — total managed memory + per-generation sizes.
-                                Gen2 >> Gen0/Gen1 → premature aging.
-                                LOH > 10% of heap → check LOH.
-  - `dumpheap -stat`         — top types by aggregate size. The winner usually
-                                IS the leak. Note its MethodTable address.
-  - `dumpheap -min 0n85000`  — LOH-resident objects (>85 KB). Many similar-sized
-                                strings here often means string concatenation
-                                in a loop (use StringBuilder).
-  - `dumpheap -type <T>`     — list instances of the suspect type. Sample a
-                                few addresses.
-  - `dumpobj <addr>`         — inspect one. Look at its field sizes — large
-                                arrays/strings inside small objects are the
-                                actual weight.
-  - `gcroot <addr>`          — retention chain. Common roots:
-                                · `Root:` ending in a `static` field → static
-                                  collection retention. NOT a "leak" per se;
-                                  it's by-design retention. Ask: should the
-                                  collection be bounded / cleared?
-                                · Chain through `EventHandler` / delegates →
-                                  event-handler leak. A long-lived publisher
-                                  is pinning subscribers via its invocation
-                                  list. Unsubscribe (-=) on dispose.
-                                · Chain through a thread-local / `[ThreadStatic]`
-                                  → thread-pinned cache that survives the
-                                  request lifetime.
-  - `gchandles -perdomain`   — handle counts. Spikes in `Strong` or `Pinned`
-                                handles often indicate interop or RCW leaks.
-
-== PLAYBOOK: hang / deadlock ==
-  - `clrthreads`             — many threads in similar states is the first
-                                tell. Count threads in "Cooperative" GC mode
-                                vs "Preemptive".
-  - `syncblk`                — sync block table. The `MonitorHeld` column on
-                                a row with N waiters means N threads are
-                                blocked on that lock; the owning thread id is
-                                in the row. (Tess's #1 hang diagnostic.)
-  - `parallelstacks`         — merged thread stacks; surfaces clusters of
-                                threads stuck at the same frame instantly.
-  - For each contended lock: `thread select <owner-id>` then `clrstack -a`.
-                              If the owner is in `Thread.SleepInternal`,
-                              `WaitOne`, or blocking I/O while holding the
-                              lock → critical section is too coarse.
-  - Look for `Monitor.ReliableEnter` in waiters' stacks — that's the lock
-    acquisition site. A `lock(this)` or `lock(typeof(T))` or `lock("literal")`
-    on a shared object is the typical culprit.
-
-== PLAYBOOK: high CPU ==
-  - `threadpool`             — worker/IOCP usage. Tess's rule: "the
-                                threadpool stops creating new threads at 80%
-                                CPU." If you see 81–100% reported, suspect GC
-                                pressure, not real work.
-  - `clrthreads` then pick threads that look busy (Cooperative + not waiting).
-                              In lldb: `thread list` shows native time per
-                              thread if the dump was captured live.
-  - For each suspect thread: `thread select N`, then `clrstack -a` and `bt`.
-  - GC pressure check: look for `coreclr!SVR::GCHeap::GarbageCollectGeneration`
-    or `gc_heap::allocate_large_object` in native stacks. If GC dominates,
-    drop to the memory playbook (LOH allocations + Gen2 collection rate are
-    the usual cause). Tess's rule: optimal Gen0:Gen1:Gen2 collection ratio is
-    100:10:1; a 1:1:1 ratio means every collection is a full GC.
-
-== PLAYBOOK: finalizer issue (large finalizer queue) ==
-  - `finalizequeue`          — objects awaiting finalization. A long queue
-                                means the finalizer thread is falling behind
-                                or blocked.
-  - `clrthreads -special`    — find the (Finalizer) thread.
-  - `thread select <finalizer-DBG-id>` then `clrstack` and `bt`.
-                              If the finalizer is in a critical section,
-                              waiting on a lock, or blocked on I/O → the
-                              objects it's trying to finalize are stuck and
-                              memory grows. Tess's classic "unblock my
-                              finalizer" pattern.
-
-== PLAYBOOK: async / task issue ==
-  - `dumpasync`              — async state machines on the heap; shows what
-                                each is awaiting and continuation chain.
-  - `dumpasync -waiting`     — only states still awaiting (not completed).
-                                Useful for "where did my Task get stuck?"
-
-== KNOWN SOS LIMITATIONS (.NET 10) ==
-  · `gcroot` may segfault libmscordaccore.so on .NET 10 dumps. If you see
-    "tool raised: target process exited" from a `gcroot` call, fall back to:
-        - `dumpheap -type System.EventHandler` (count delegates)
-        - `dumpheap -type System.Object[]` then `dumpobj` each (look for
-          backing arrays of static collections)
-        - Reason about retention from `dumpheap -stat` ratios instead.
-    The session is unaffected — the next MCP call gets a fresh lldb.
-
-== TELLS / HEURISTICS (Tess-named patterns) ==
-  · MonitorHeld with many waiters → serialized critical section.
-  · gcroot ending at a static field → "not a leak, retention by design."
-  · Many large `System.String[]` or `System.Char[]` instances on LOH → string
-    concatenation in a loop.
-  · `EventHandler` / `MulticastDelegate` in a gcroot chain → event handler
-    leak; the subscriber can't be GC'd because the publisher still references
-    it through the invocation list.
-  · Many `System.Threading.Tasks.Task` in `dumpheap -stat` with growing count
-    over a real-time series → unawaited tasks accumulating; check for
-    fire-and-forget patterns.
-  · `RuntimeCallableWrapper` accumulation → COM interop leak.
-
-== SYMBOLS ==
-  Source-line resolution in `clrstack` needs PDBs adjacent to the DLLs on
-  the target. If method names show but file:line doesn't, the PDBs aren't
-  findable. Ask the user to copy their `publish/` output into the target.
-
-== CITING FINDINGS ==
-  When you reference a frame, include file:line if shown by `clrstack`,
-  otherwise the IL offset. When you cite a heap object, include its
-  MethodTable address (so the user can reproduce `dumpheap -mt <addr>`).
+Prompts (prompts/list) offer one-shot scenario kickoffs (e.g. /analyze-memory).
 """
+
+
+# === Per-scenario playbooks, exposed as resources ============================
+
+PLAYBOOKS = {
+    "crash": """\
+# Crash / unhandled exception playbook
+
+1. `clrthreads` — the rightmost "Exception" column flags the thread that
+   has a pending exception (usually the faulting thread).
+2. `thread select <DBG-id-with-Exception>`
+3. `pe -nested` — exception type, message, and inner exceptions.
+4. `clrstack -a` — managed stack with locals and parameters.
+5. Read the source at the top frame's file:line and explain the failure path.
+
+Cite findings as `Type.Method [File.cs @ line]` if `clrstack` showed source
+info; otherwise as `Type.Method+0xOFFSET` (IL offset).
+""",
+    "memory": """\
+# Memory issue / leak / OOM playbook
+
+1. `eeheap -gc` — total managed memory + per-generation sizes.
+   - Gen2 >> Gen0/Gen1   → premature aging (objects surviving collections).
+   - LOH > 10% of heap   → check LOH (next step).
+2. `dumpheap -stat` — top types by aggregate size. The winner usually IS the
+   leak. Note its MethodTable address (first column).
+3. `dumpheap -min 0n85000` — LOH-resident objects (≥85 KB). Many similar-sized
+   strings here often means string concatenation in a loop (use StringBuilder).
+4. `dumpheap -type <T>` — list instances of the suspect type. Sample a few.
+5. `dumpobj <addr>` — inspect one. Look at its field sizes — large arrays /
+   strings inside small objects are where the weight actually is.
+6. `gcroot <addr>` — retention chain. Common roots:
+   - Ends in a `static` field   → static-collection retention. NOT really a
+                                  "leak" — it's by-design retention. Ask the
+                                  user: should the collection be bounded /
+                                  cleared on some event?
+   - Chain through `EventHandler` / `MulticastDelegate` → event-handler leak.
+                                  A long-lived publisher is pinning subscribers
+                                  via its invocation list. Fix with `-=` on
+                                  dispose.
+   - Chain through `[ThreadStatic]` / thread-local → thread-pinned cache that
+                                  survives the request lifetime.
+7. `gchandles -perdomain` — handle counts. Spikes in `Strong` or `Pinned`
+   often indicate interop or RCW leaks.
+
+CAVEAT: on .NET 10, `gcroot` may segfault libmscordaccore.so. See
+`netcore-lldb://known-issues` for workarounds.
+""",
+    "hang": """\
+# Hang / deadlock playbook
+
+1. `clrthreads` — many threads in similar states is the first tell. Count
+   threads in "Cooperative" GC mode vs "Preemptive".
+2. `syncblk` — Tess's #1 hang diagnostic. Look at the `MonitorHeld` column:
+   a row with N > 1 means N-1 threads are blocked on that lock; the owning
+   OSID is in the row's "Owning Thread Info" column.
+3. `parallelstacks` — merged thread stacks; surfaces clusters of threads
+   stuck at the same frame instantly.
+4. For each contended lock: `thread select <owner-DBG-id>` then `clrstack -a`.
+   - Owner in `Thread.SleepInternal`, `WaitOne`, or blocking I/O while
+     holding the lock → the critical section is too coarse.
+5. Look for `System.Threading.Monitor.ReliableEnter` in the waiters'
+   `clrstack` output — that's the lock acquisition site. `lock(this)`,
+   `lock(typeof(T))`, and `lock("string literal")` on a shared object are
+   the typical culprits.
+""",
+    "high-cpu": """\
+# High CPU playbook
+
+1. `threadpool` — worker/IOCP usage. Tess's "80% rule": the .NET threadpool
+   stops creating new threads at 80% CPU. If you see 81–100% reported,
+   suspect **GC pressure**, not real work.
+2. `clrthreads` — pick threads that look busy (Cooperative + not waiting).
+   In lldb itself: `thread list` shows per-thread CPU time when available.
+3. For each suspect thread: `thread select <N>`, then `clrstack -a` and `bt`.
+4. **GC pressure check** — look for these in native stacks (`bt`):
+   - `coreclr!SVR::GCHeap::GarbageCollectGeneration` → in GC.
+   - `gc_heap::allocate_large_object` → LOH allocation triggering GC.
+   If GC dominates, switch to the memory playbook — LOH allocations + Gen2
+   collection rate are the usual cause.
+
+Tess's optimal Gen0:Gen1:Gen2 collection ratio is **100:10:1**. A **1:1:1**
+ratio means every collection is a full GC — pathological.
+""",
+    "finalizer": """\
+# Finalizer issue playbook
+
+1. `finalizequeue` — objects awaiting finalization. A long queue means the
+   finalizer thread is falling behind or blocked.
+2. `clrthreads -special` — find the `(Finalizer)` thread (typically DBG id 8
+   in .NET Core / .NET 5+).
+3. `thread select <finalizer-DBG-id>` then `clrstack` and `bt`.
+   - If the finalizer is in a critical section, waiting on a lock, or
+     blocked on I/O → the object it's trying to finalize is stuck and
+     memory grows. This is Tess's "unblock my finalizer" pattern.
+
+Common fixes:
+- Wrap finalizer body in `try/catch` so one bad finalizer doesn't kill the
+  thread.
+- Don't take locks in finalizers — they run on a single, serialized thread.
+""",
+    "async": """\
+# Async / Task stuck playbook
+
+1. `dumpasync` — async state machines on the heap; shows what each is
+   awaiting and the continuation chain.
+2. `dumpasync -waiting` — only state machines still awaiting (not completed).
+   Useful for "where did my `Task` get stuck?"
+3. For accumulating unawaited tasks: `dumpheap -stat` and look for high
+   counts of `System.Threading.Tasks.Task` and `Task<...>`. Fire-and-forget
+   patterns are the usual cause.
+""",
+}
+
+HEURISTICS_TEXT = """\
+# Tess-named patterns
+
+- **MonitorHeld with many waiters** → serialized critical section. Drill
+  into the owning thread's `clrstack` to find what's holding it.
+- **gcroot ending at a static field** → "not a leak, retention by design."
+  Ask whether the collection should be bounded or cleared.
+- **Many large `System.String[]` or `System.Char[]` on LOH** → string
+  concatenation in a loop. Switch to `StringBuilder`.
+- **`EventHandler` / `MulticastDelegate` in a gcroot chain** → event-handler
+  leak. The subscriber can't be GC'd because the publisher still references
+  it through the delegate's invocation list. Fix with `-=` on dispose.
+- **Many `System.Threading.Tasks.Task` instances growing over time** →
+  unawaited / fire-and-forget tasks accumulating.
+- **`RuntimeCallableWrapper` accumulation** → COM interop leak.
+- **80% threadpool utilization** → threadpool stops creating threads at 80%;
+  anything above suggests GC pressure, not real work.
+- **Gen0:Gen1:Gen2 collection ratio = 1:1:1** → every collection is a full
+  GC. Optimal is 100:10:1.
+"""
+
+KNOWN_ISSUES_TEXT = """\
+# Known SOS limitations (.NET 10)
+
+## `gcroot` segfaults libmscordaccore.so on some .NET 10 dumps
+
+If `gcroot <addr>` returns `tool raised: target process exited`, lldb
+crashed inside the DAC. Our client surfaces this as `isError: true`; the
+session is unaffected — the next `lldb_command` call spawns a fresh lldb.
+
+**Workarounds** (heap-statistics-based reasoning):
+- `dumpheap -type System.EventHandler` — counts delegate instances. Many
+  EventHandlers + matching subscriber count = event-handler leak.
+- `dumpheap -type System.Object[]` then `dumpobj <addr>` on each — look for
+  backing arrays of static collections.
+- Reason about retention from `dumpheap -stat` type-vs-count ratios.
+"""
+
+
+# === MCP resources ===========================================================
+
+RESOURCES = [
+    *[
+        {
+            "uri": f"netcore-lldb://playbook/{name}",
+            "name": f"Playbook: {name}",
+            "description": text.splitlines()[0].lstrip("# ").strip(),
+            "mimeType": "text/markdown",
+        }
+        for name, text in PLAYBOOKS.items()
+    ],
+    {
+        "uri": "netcore-lldb://session",
+        "name": "Session info",
+        "description": "Transport, lldb version, dump path, and SOS-load status of the connected target.",
+        "mimeType": "application/json",
+    },
+    {
+        "uri": "netcore-lldb://modules",
+        "name": "Loaded managed modules",
+        "description": "Output of SOS `clrmodules -v` against the dump. Use to discover assemblies and check for missing PDBs.",
+        "mimeType": "text/plain",
+    },
+    {
+        "uri": "netcore-lldb://threads",
+        "name": "Managed threads",
+        "description": "Output of SOS `clrthreads` against the dump. The rightmost Exception column flags the faulting thread.",
+        "mimeType": "text/plain",
+    },
+    {
+        "uri": "netcore-lldb://heuristics",
+        "name": "Tess-named diagnostic patterns",
+        "description": "Quick-reference tells (MonitorHeld, gcroot-static, 80% threadpool rule, etc.)",
+        "mimeType": "text/markdown",
+    },
+    {
+        "uri": "netcore-lldb://known-issues",
+        "name": "Known SOS limitations",
+        "description": "Workarounds for upstream SOS bugs that affect analysis (e.g. .NET 10 gcroot crash).",
+        "mimeType": "text/markdown",
+    },
+]
+
+
+# === MCP prompts =============================================================
+
+# Per-scenario one-shot kickoffs. Claude Code surfaces these as /-completions.
+# Each prompt returns a single user-role message that primes the LLM with the
+# scenario, optionally including the user's free-text description.
+
+PROMPT_DEFS = {
+    "analyze-crash":     ("crash",     "Diagnose an unhandled exception / crash captured in the dump."),
+    "analyze-memory":    ("memory",    "Investigate a memory issue (high RSS, suspected leak, OOM)."),
+    "analyze-hang":      ("hang",      "Investigate a hang or deadlock."),
+    "analyze-high-cpu":  ("high-cpu",  "Investigate high CPU usage / GC pressure."),
+    "analyze-finalizer": ("finalizer", "Investigate a finalizer-thread issue (long queue, blocked finalizer)."),
+    "analyze-async":     ("async",     "Investigate stuck async Tasks / state machines."),
+    "overview":          (None,        "Give a quick overview of what's in the dump (runtime, threads, top heap types) with no specific hypothesis."),
+}
+
+PROMPTS = [
+    {
+        "name": name,
+        "description": desc,
+        "arguments": [{
+            "name": "user_description",
+            "description": "What the user knows or has observed about the issue (optional).",
+            "required": False,
+        }],
+    }
+    for name, (_, desc) in PROMPT_DEFS.items()
+]
 
 TOOLS = [
     {
@@ -690,6 +809,78 @@ def _dispatch_tool(session: LldbSession, target_info: dict, name: str, args: dic
     return (f"unknown tool: {name!r}", True)
 
 
+def _resource_contents(uri: str, session: LldbSession, target_info: dict) -> list[dict]:
+    """Materialize the contents for a given resource URI. Raises ValueError on
+    unknown URIs so the caller can map to JSON-RPC -32602 (invalid params)."""
+    if uri.startswith("netcore-lldb://playbook/"):
+        scenario = uri.split("/", 3)[-1]
+        text = PLAYBOOKS.get(scenario)
+        if text is None:
+            raise ValueError(f"unknown playbook: {scenario}. "
+                             f"Available: {', '.join(sorted(PLAYBOOKS))}.")
+        return [{"uri": uri, "mimeType": "text/markdown", "text": text}]
+    if uri == "netcore-lldb://session":
+        return [{"uri": uri, "mimeType": "application/json",
+                 "text": json.dumps(target_info, indent=2, default=str)}]
+    if uri == "netcore-lldb://modules":
+        return [{"uri": uri, "mimeType": "text/plain", "text": session.run("clrmodules -v")}]
+    if uri == "netcore-lldb://threads":
+        return [{"uri": uri, "mimeType": "text/plain", "text": session.run("clrthreads")}]
+    if uri == "netcore-lldb://heuristics":
+        return [{"uri": uri, "mimeType": "text/markdown", "text": HEURISTICS_TEXT}]
+    if uri == "netcore-lldb://known-issues":
+        return [{"uri": uri, "mimeType": "text/markdown", "text": KNOWN_ISSUES_TEXT}]
+    raise ValueError(f"unknown resource: {uri!r}")
+
+
+def _resolve_prompt(name: str, args: dict) -> dict:
+    """Materialize a prompt by name into MCP {description, messages}. Raises
+    ValueError on unknown prompts."""
+    entry = PROMPT_DEFS.get(name)
+    if entry is None:
+        raise ValueError(f"unknown prompt: {name!r}. "
+                         f"Available: {', '.join(sorted(PROMPT_DEFS))}.")
+    scenario, description = entry
+    user_description = (args.get("user_description") or "").strip()
+    user_note = f"\n\nThe user says: {user_description}" if user_description else ""
+    if scenario:
+        playbook_uri = f"netcore-lldb://playbook/{scenario}"
+        message = (
+            f"I'm analyzing a .NET Linux core dump. Help me with the following: "
+            f"{description.lower().rstrip('.')}.{user_note}\n\n"
+            f"Step 1: read the playbook at `{playbook_uri}` via `resources/read`.\n"
+            f"Step 2: also read `netcore-lldb://session` so you know which target "
+            f"and dump you're connected to.\n"
+            f"Step 3: follow the playbook using the `lldb_command` tool. Cite "
+            f"findings with file:line where `clrstack` shows them; otherwise "
+            f"with IL offset. Explain in plain English what's happening and what "
+            f"to fix."
+        )
+    else:
+        # Generic overview (no specific playbook).
+        message = (
+            f"I'm analyzing a .NET Linux core dump. Give me a quick overview.{user_note}\n\n"
+            f"Read `netcore-lldb://session` and `netcore-lldb://threads`, then run "
+            f"`eeversion`, `clrthreads`, `clrmodules` via `lldb_command`, and "
+            f"summarize: runtime version, top heap types from `dumpheap -stat`, "
+            f"any thread with a pending exception, and any obvious smell (LOH "
+            f"dominated by strings, MonitorHeld > 1, finalizer queue long, etc.)."
+        )
+    return {
+        "description": description,
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": message}}
+        ],
+    }
+
+
+_CAPABILITIES = {
+    "tools":     {"listChanged": True},
+    "resources": {"listChanged": True},
+    "prompts":   {"listChanged": True},
+}
+
+
 def handle(session: LldbSession, target_info: dict, msg: dict) -> dict | None:
     method = msg.get("method")
     msg_id = msg.get("id")
@@ -699,7 +890,7 @@ def handle(session: LldbSession, target_info: dict, msg: dict) -> dict | None:
             "jsonrpc": "2.0", "id": msg_id,
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
+                "capabilities": _CAPABILITIES,
                 "serverInfo": SERVER_INFO,
                 "instructions": INSTRUCTIONS,
             },
@@ -716,6 +907,27 @@ def handle(session: LldbSession, target_info: dict, msg: dict) -> dict | None:
             log(f"tool error: {exc}\n{traceback.format_exc()}")
             return _tool_result(msg_id, f"tool raised: {exc}", is_error=True)
         return _tool_result(msg_id, text, is_error)
+    if method == "resources/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": RESOURCES}}
+    if method == "resources/read":
+        uri = (msg.get("params") or {}).get("uri", "")
+        try:
+            contents = _resource_contents(uri, session, target_info)
+        except ValueError as exc:
+            return _error(msg_id, -32602, str(exc))
+        except Exception as exc:
+            log(f"resource read error for {uri!r}: {exc}\n{traceback.format_exc()}")
+            return _error(msg_id, -32603, f"resource read failed: {exc}")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"contents": contents}}
+    if method == "prompts/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"prompts": PROMPTS}}
+    if method == "prompts/get":
+        params = msg.get("params") or {}
+        try:
+            result = _resolve_prompt(params.get("name", ""), params.get("arguments") or {})
+        except ValueError as exc:
+            return _error(msg_id, -32602, str(exc))
+        return {"jsonrpc": "2.0", "id": msg_id, "result": result}
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
     if method == "shutdown":

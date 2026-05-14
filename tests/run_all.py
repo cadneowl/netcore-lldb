@@ -340,6 +340,195 @@ def test_mcp_bad_command_arg():
 
 
 # ============================================================================
+# Tests — MCP resources (Phase 1)
+# ============================================================================
+
+def test_mcp_initialize_advertises_resources_and_prompts():
+    name = "[common] initialize advertises tools + resources + prompts capabilities"
+    msgs = initialize_seq()
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 1)
+    caps = (r or {}).get("result", {}).get("capabilities", {})
+    ok = (set(caps.keys()) >= {"tools", "resources", "prompts"}
+          and caps.get("resources", {}).get("listChanged") is True
+          and caps.get("prompts", {}).get("listChanged") is True)
+    record(name, ok, f"capabilities keys: {sorted(caps.keys())}")
+
+
+def test_resources_list_returns_playbooks_and_state():
+    name = "[common] resources/list returns playbooks + live state resources"
+    msgs = initialize_seq() + [{"jsonrpc": "2.0", "id": 2, "method": "resources/list"}]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    uris = {x["uri"] for x in (r or {}).get("result", {}).get("resources", [])}
+    expected = {
+        "netcore-lldb://playbook/crash",
+        "netcore-lldb://playbook/memory",
+        "netcore-lldb://playbook/hang",
+        "netcore-lldb://playbook/high-cpu",
+        "netcore-lldb://playbook/finalizer",
+        "netcore-lldb://playbook/async",
+        "netcore-lldb://session",
+        "netcore-lldb://modules",
+        "netcore-lldb://threads",
+        "netcore-lldb://heuristics",
+        "netcore-lldb://known-issues",
+    }
+    missing = expected - uris
+    ok = not missing
+    record(name, ok, f"missing: {missing or '(none)'}")
+
+
+def test_resources_read_playbook_crash():
+    name = "[common] resources/read on a playbook returns text/markdown content"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+         "params": {"uri": "netcore-lldb://playbook/crash"}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    contents = (r or {}).get("result", {}).get("contents", [])
+    ok = (len(contents) == 1
+          and contents[0]["uri"] == "netcore-lldb://playbook/crash"
+          and contents[0]["mimeType"] == "text/markdown"
+          and "pe -nested" in contents[0]["text"]
+          and "clrstack -a" in contents[0]["text"])
+    record(name, ok)
+
+
+def test_resources_read_session_returns_json():
+    name = "[common] resources/read on netcore-lldb://session returns valid JSON"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+         "params": {"uri": "netcore-lldb://session"}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    contents = (r or {}).get("result", {}).get("contents", [])
+    if not contents or contents[0].get("mimeType") != "application/json":
+        record(name, False, f"got: {contents}")
+        return
+    try:
+        data = json.loads(contents[0]["text"])
+    except Exception as exc:
+        record(name, False, f"json parse failed: {exc}")
+        return
+    ok = ("transport" in data and "lldb_version" in data and "dump_path" in data)
+    record(name, ok, f"keys: {sorted(data.keys())}")
+
+
+def test_resources_read_modules_runs_clrmodules():
+    name = "[docker] resources/read netcore-lldb://modules invokes SOS clrmodules"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+         "params": {"uri": "netcore-lldb://modules"}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs, timeout=120)
+    r = find_response(responses, 2)
+    contents = (r or {}).get("result", {}).get("contents", [])
+    text = contents[0]["text"] if contents else ""
+    ok = "System.Private.CoreLib" in text
+    record(name, ok, f"len(text)={len(text)}")
+
+
+def test_resources_read_threads_runs_clrthreads():
+    name = "[docker] resources/read netcore-lldb://threads invokes SOS clrthreads"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+         "params": {"uri": "netcore-lldb://threads"}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs, timeout=120)
+    r = find_response(responses, 2)
+    contents = (r or {}).get("result", {}).get("contents", [])
+    text = contents[0]["text"] if contents else ""
+    ok = ("InvalidOperationException" in text and "ThreadCount:" in text)
+    record(name, ok, f"len(text)={len(text)}")
+
+
+def test_resources_read_unknown_uri_returns_invalid_params():
+    name = "[common] resources/read on unknown uri returns JSON-RPC -32602"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+         "params": {"uri": "netcore-lldb://no-such-resource"}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    err = (r or {}).get("error", {})
+    ok = err.get("code") == -32602 and "unknown resource" in err.get("message", "").lower()
+    record(name, ok, f"error: {err}")
+
+
+# ============================================================================
+# Tests — MCP prompts (Phase 2)
+# ============================================================================
+
+def test_prompts_list_returns_scenario_prompts():
+    name = "[common] prompts/list returns analyze-* prompts + overview"
+    msgs = initialize_seq() + [{"jsonrpc": "2.0", "id": 2, "method": "prompts/list"}]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    names = {p["name"] for p in (r or {}).get("result", {}).get("prompts", [])}
+    expected = {"analyze-crash", "analyze-memory", "analyze-hang",
+                "analyze-high-cpu", "analyze-finalizer", "analyze-async",
+                "overview"}
+    missing = expected - names
+    ok = not missing
+    record(name, ok, f"missing: {missing or '(none)'}")
+
+
+def test_prompts_get_analyze_memory_references_memory_playbook():
+    name = "[common] prompts/get analyze-memory returns a message referencing the memory playbook"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+         "params": {"name": "analyze-memory", "arguments": {"user_description": "RSS climbing fast"}}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    result = (r or {}).get("result", {})
+    messages = result.get("messages", [])
+    text = ""
+    if messages:
+        c = messages[0].get("content", {})
+        text = c.get("text", "") if isinstance(c, dict) else ""
+    ok = ("netcore-lldb://playbook/memory" in text
+          and "RSS climbing fast" in text
+          and result.get("description"))
+    record(name, ok, f"text head: {text[:120]!r}")
+
+
+def test_prompts_get_overview_no_playbook():
+    name = "[common] prompts/get overview returns a generic kickoff (no specific playbook)"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+         "params": {"name": "overview", "arguments": {}}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    text = ""
+    msgs_out = (r or {}).get("result", {}).get("messages", [])
+    if msgs_out:
+        c = msgs_out[0].get("content", {})
+        text = c.get("text", "") if isinstance(c, dict) else ""
+    ok = ("quick overview" in text.lower()
+          and "eeversion" in text
+          and "playbook/" not in text)  # no specific playbook referenced
+    record(name, ok, f"text head: {text[:120]!r}")
+
+
+def test_prompts_get_unknown_returns_invalid_params():
+    name = "[common] prompts/get unknown name returns JSON-RPC -32602"
+    msgs = initialize_seq() + [
+        {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+         "params": {"name": "no-such-prompt", "arguments": {}}}
+    ]
+    responses, _, _ = drive(COMMON_ARGS, msgs)
+    r = find_response(responses, 2)
+    err = (r or {}).get("error", {})
+    ok = err.get("code") == -32602 and "unknown prompt" in err.get("message", "").lower()
+    record(name, ok, f"error: {err}")
+
+
+# ============================================================================
 # Tests — SOS commands via docker exec
 # ============================================================================
 
@@ -978,6 +1167,19 @@ def main() -> int:
         test_mcp_unknown_method()
         test_mcp_unknown_tool()
         test_mcp_bad_command_arg()
+
+        print("\n--- MCP resources + prompts (Phases 1 & 2) ---")
+        test_mcp_initialize_advertises_resources_and_prompts()
+        test_resources_list_returns_playbooks_and_state()
+        test_resources_read_playbook_crash()
+        test_resources_read_session_returns_json()
+        test_resources_read_modules_runs_clrmodules()
+        test_resources_read_threads_runs_clrthreads()
+        test_resources_read_unknown_uri_returns_invalid_params()
+        test_prompts_list_returns_scenario_prompts()
+        test_prompts_get_analyze_memory_references_memory_playbook()
+        test_prompts_get_overview_no_playbook()
+        test_prompts_get_unknown_returns_invalid_params()
 
         print("\n--- SOS via docker exec ---")
         test_sos_eeversion_docker()
