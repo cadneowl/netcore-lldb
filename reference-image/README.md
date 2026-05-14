@@ -11,7 +11,19 @@ The image is **not the product** — the product is the client tool in
    container infrastructure.
 2. As a documented example of what a "debugging-ready target" needs.
 
-## Build
+## Pull (published image)
+
+Each tagged release of this repo publishes the image to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/cadneowl/netcore-lldb:latest
+# or pin a specific release
+docker pull ghcr.io/cadneowl/netcore-lldb:v0.3.0
+```
+
+(The image is public; no authentication needed to pull.)
+
+## Or build locally
 
 ```bash
 docker build -t netcore-lldb:dev ../reference-image
@@ -21,11 +33,12 @@ docker build -t netcore-lldb:dev ../reference-image
 
 ## Use
 
-Start a long-running container from the image:
+Start a long-running container from the image (either the published one or
+the local build — substitute the image name accordingly):
 
 ```bash
 docker run -d --name dump-analyzer --entrypoint sleep \
-    netcore-lldb:dev infinity
+    ghcr.io/cadneowl/netcore-lldb:latest infinity
 ```
 
 Stage your dump and published app inside it:

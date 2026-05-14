@@ -187,6 +187,23 @@ slightly less precise locations:
 
 ---
 
+## Optional: try the tool against a reference container
+
+Don't have a Docker container with your .NET app running, or just want to
+kick the tires? Pull the prebuilt reference image and use it as a sandbox:
+
+```bash
+docker pull ghcr.io/cadneowl/netcore-lldb:latest
+docker run -d --name dump-analyzer --entrypoint sleep \
+    ghcr.io/cadneowl/netcore-lldb:latest infinity
+# copy your dump in
+docker cp /path/to/your/dump.core dump-analyzer:/work/dump.core
+docker cp /path/to/your/publish/. dump-analyzer:/work/app/
+```
+
+Then in `.mcp.json` point `--docker dump-analyzer`. See `reference-image/README.md`
+for what's inside.
+
 ## Analyzing a dump captured elsewhere
 
 When the crash happened in container/host A but you want to analyze it on
