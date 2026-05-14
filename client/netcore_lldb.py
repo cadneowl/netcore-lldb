@@ -391,21 +391,41 @@ class Transport:
             return 127, "", str(exc)
 
     def copy_to_target(self, local_path: str, remote_path: str) -> None:
-        """Copy a local file to the target."""
+        """Copy a local file to the target.
+
+        Capture stdout/stderr explicitly — our own stdout is the MCP message
+        stream to Claude Code, so even a 'Successfully copied...' line from
+        `docker cp` would corrupt the JSON-RPC framing."""
         if self.kind == "docker":
-            subprocess.check_call(
-                ["docker", "cp", local_path, f"{self.address}:{remote_path}"],
-                stdin=subprocess.DEVNULL,
-            )
+            argv = ["docker", "cp", local_path, f"{self.address}:{remote_path}"]
         elif self.kind == "ssh":
-            subprocess.check_call(
-                ["scp", "-o", "BatchMode=yes",
-                 "-o", "StrictHostKeyChecking=accept-new",
-                 local_path, f"{self.address}:{remote_path}"],
-                stdin=subprocess.DEVNULL,
-            )
+            argv = ["scp",
+                    "-o", "BatchMode=yes",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    local_path, f"{self.address}:{remote_path}"]
         else:
             raise ValueError(f"unknown transport: {self.kind}")
+        try:
+            result = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            raise SystemExit(f"file copy timed out after 600s: {' '.join(argv[:3])}")
+        except subprocess.CalledProcessError as exc:
+            raise SystemExit(
+                f"file copy failed (rc={exc.returncode}): {' '.join(argv[:3])}\n"
+                f"stderr: {(exc.stderr or '').strip()}"
+            )
+        # Tools like docker cp can print "Successfully copied..." even on success;
+        # log it to stderr so it doesn't end up in the MCP stream.
+        if result.stdout.strip():
+            log(f"copy: {result.stdout.strip()}")
 
 
 def make_transport(args) -> Transport:
@@ -537,18 +557,32 @@ class LldbSession:
                 return text
 
     def close(self) -> None:
+        """Tear down the lldb subprocess. Logs each cleanup step so a Ctrl-C
+        path or a session-died path leaves a trail rather than silently
+        dropping the remote lldb (which would keep running and holding the
+        dump file open under `ssh` — `docker exec` cleans up naturally)."""
         try:
             os.write(self.master, b"quit\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            log(f"close: sending 'quit' to lldb failed: {exc}")
         try:
-            self.proc.wait(timeout=5)
+            rc = self.proc.wait(timeout=5)
+            log(f"close: lldb exited cleanly with code {rc}")
         except subprocess.TimeoutExpired:
+            log("close: lldb did not exit within 5s; sending SIGKILL")
             self.proc.kill()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log("close: lldb still alive after SIGKILL — orphaned process likely")
+                if self.transport.kind == "ssh":
+                    log("close: NOTE: with --ssh, killing the local ssh client doesn't "
+                        "always reap the remote lldb. If this becomes a habit, "
+                        "ssh in and `pkill lldb`.")
         try:
             os.close(self.master)
-        except OSError:
-            pass
+        except OSError as exc:
+            log(f"close: pty master close failed (likely already closed): {exc}")
 
 
 # ----- Bootstrap & preflight ------------------------------------------------
@@ -586,15 +620,19 @@ def detect_distro(transport: Transport) -> str:
 
 
 def needs_sudo(transport: Transport) -> str:
-    """Return 'sudo -n ' if the target isn't already root, else ''.
-    If sudo is needed but unavailable, return None and let the caller surface the error."""
+    """Return 'sudo -n ' if the target isn't already root and passwordless
+    sudo works; '' if the target is root; '' (with a clear log warning) if
+    sudo is needed but unavailable — the subsequent apt/dnf call will then
+    surface a permission error to the caller."""
     rc, out, _ = transport.run("id -u", timeout=5)
-    if out.strip() == "0":
+    if rc == 0 and out.strip() == "0":
         return ""
     rc, _, _ = transport.run("sudo -n true 2>/dev/null", timeout=5)
     if rc == 0:
         return "sudo -n "
-    return ""  # try anyway; will fail with a clear apt/dnf permission error
+    log("bootstrap: target is non-root and passwordless sudo is unavailable; "
+        "package install will likely fail with a permission error.")
+    return ""
 
 
 def bootstrap_target(transport: Transport) -> None:
@@ -684,14 +722,18 @@ def bootstrap_target(transport: Transport) -> None:
     if "SOS install succeeded" not in out and "succeeded" not in out.lower():
         log(f"bootstrap: WARNING: SOS install reported:\n{out[-800:]}")
 
-    rc, out, _ = transport.run(
-        "test -f $HOME/.dotnet/sos/libsosplugin.so && echo ok || echo missing",
-        timeout=5,
-    )
-    if "ok" in out:
+    # Verify by direct rc check on `test -f` (not by substring-matching stdout —
+    # that pattern would misdiagnose a transport timeout as "SOS missing").
+    rc, _, err = transport.run("test -f $HOME/.dotnet/sos/libsosplugin.so", timeout=5)
+    if rc == 0:
         log("bootstrap: SOS plugin installed at ~/.dotnet/sos/libsosplugin.so")
-    else:
+    elif rc == 1:
         raise SystemExit("bootstrap: SOS plugin file is missing after install. See log above.")
+    else:
+        raise SystemExit(
+            f"bootstrap: could not verify SOS plugin (rc={rc}, transport error?). "
+            f"stderr: {err.strip()}"
+        )
 
 
 def preflight(transport: Transport, dump_path: str, bootstrap: bool) -> dict:
@@ -880,6 +922,9 @@ _CAPABILITIES = {
     "prompts":   {"listChanged": True},
 }
 
+# Set by the `shutdown` MCP method and by SIGTERM/SIGINT; checked by main loop.
+_SHUTDOWN_FLAG: dict = {"flag": False}
+
 
 def handle(session: LldbSession, target_info: dict, msg: dict) -> dict | None:
     method = msg.get("method")
@@ -931,6 +976,10 @@ def handle(session: LldbSession, target_info: dict, msg: dict) -> dict | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
     if method == "shutdown":
+        # MCP spec: after `shutdown`, the server should stop accepting new
+        # requests; the client follows up with `exit`. Set the loop-exit flag
+        # via the same signal-shutdown path so the main loop tears down cleanly.
+        _SHUTDOWN_FLAG["flag"] = True
         return {"jsonrpc": "2.0", "id": msg_id, "result": None}
     if msg_id is not None:
         return _error(msg_id, -32601, f"method not found: {method}")
@@ -984,15 +1033,13 @@ def main() -> int:
     session = LldbSession(transport, dump_on_target, exec_path=args.exec_path)
     log("MCP server ready (stdio)")
 
-    shutdown_requested = {"flag": False}
-
     def request_shutdown(*_):
-        shutdown_requested["flag"] = True
+        _SHUTDOWN_FLAG["flag"] = True
 
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
 
-    while not shutdown_requested["flag"]:
+    while not _SHUTDOWN_FLAG["flag"]:
         try:
             msg = read_message()
         except json.JSONDecodeError as exc:
@@ -1004,8 +1051,9 @@ def main() -> int:
         try:
             resp = handle(session, target_info, msg)
         except Exception as exc:
-            log(f"handler error: {exc}\n{traceback.format_exc()}")
-            resp = _error(msg.get("id"), -32603, f"internal error: {exc}")
+            log(f"handler error: {type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+            resp = _error(msg.get("id"), -32603,
+                          f"internal error ({type(exc).__name__}): {exc}")
         if resp is not None:
             write_message(resp)
 
