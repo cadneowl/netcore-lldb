@@ -38,15 +38,27 @@ jobs:
 
       - name: Compute tags
         id: meta
+        env:
+          # Bind user input via env so it CANNOT be interpolated into the shell
+          # script context (which would otherwise be a textbook injection).
+          # See https://docs.github.com/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
+          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/netcore-lldb
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
             VERSION="${GITHUB_REF#refs/tags/}"
-          elif [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
+          elif [ -n "$INPUT_TAG" ]; then
+            VERSION="$INPUT_TAG"
           else
             VERSION="edge"
           fi
-          IMAGE="ghcr.io/${{ github.repository_owner }}/netcore-lldb"
+          # Reject anything that isn't a sane image-tag character set.
+          if ! printf '%s' "$VERSION" | grep -qE '^[A-Za-z0-9._-]+$'; then
+            echo "::error::refusing to publish with malformed tag: $VERSION" >&2
+            exit 1
+          fi
           {
             echo "version=$VERSION"
             echo "image=$IMAGE"

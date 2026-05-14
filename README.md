@@ -291,6 +291,39 @@ For a Kubernetes-deployed app, add these to your `Deployment.spec.template.spec.
 
 ---
 
+## Privacy & data flow
+
+A .NET memory dump contains the **entire process memory** at the moment of
+the crash — user data, secrets, tokens, cached request/response bodies,
+env vars. This tool's job is to make slices of that memory readable, so by
+definition some of what's in the dump can reach the LLM. **Read
+[`PRIVACY.md`](./PRIVACY.md) before pointing `netcore-lldb` at a production
+dump.**
+
+The short version:
+
+- **The dump file never leaves the target.** lldb runs on the target; only
+  short text command outputs cross the wire.
+- **Source files Claude opens during analysis** get sent to Anthropic's
+  API as part of its context.
+- **Default playbooks run `pe`, `clrstack -a`, `dumpheap -stat`** — so on
+  a prod dump, customer data will reach Anthropic by default.
+
+Risk summary by command:
+
+| Risk | Commands |
+|---|---|
+| 🔴 High | `pe`, `pe -nested`, `clrstack -a`, `dso`, `dumpobj`, `dumpheap -type System.String`, `du`, `memory read` |
+| 🟡 Moderate | `clrthreads`, `target_info`, `netcore-lldb://session` / `://modules` |
+| 🟢 Low | `dumpheap -stat`, `eeheap -gc`, `eeversion`, `clrmodules`, `threadpool`, `gcheapstat` |
+
+Quick mitigations (see [`PRIVACY.md`](./PRIVACY.md) for the full menu):
+
+- Analyze a **staging** dump with synthetic data instead of a prod dump.
+- Capture a smaller dump type (`DOTNET_DbgMiniDumpType=1` = mini, or `3` = triage) — less memory captured, fewer PII vectors, still enough for most crash analyses.
+- Tell Claude *"don't dump raw string contents; summarize structurally"* in your project's `CLAUDE.md` or the conversation.
+- For enterprise / regulated workloads: a Zero Data Retention agreement with Anthropic, or a self-hosted MCP client + local LLM (the server is LLM-agnostic — Claude Code is one option among many).
+
 ## How it works
 
 A small client tool (Python script, stdlib only) runs on your laptop as an
