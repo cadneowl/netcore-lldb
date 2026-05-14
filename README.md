@@ -134,19 +134,40 @@ runs it verifies in ~4 seconds and does nothing else.
 ### Step 4 — Ask Claude (10 seconds)
 
 Open Claude Code in the project where `.mcp.json` lives **and where your
-source repo is**. Then just ask, in English:
+source repo is**. You have two equally good ways to start:
+
+**Option A — type a question in English:**
 
 > Analyze the .NET crash dump and tell me what went wrong.
 
-That's it. You don't need to know lldb, SOS, or anything else.
-
-Other prompts that work:
+Other questions that work:
 
 > Memory is growing in production. What's leaking in this dump?
 >
 > The app hangs intermittently. Does this dump show a deadlock?
 >
 > Why is CPU stuck at 100%? Look at the dump and tell me which thread is busy.
+
+**Option B — use a slash-prompt for a one-click kickoff:**
+
+In Claude Code, type `/` and pick one of:
+
+| Prompt | When to use |
+|---|---|
+| `/analyze-crash` | Unhandled exception / crash dump |
+| `/analyze-memory` | Suspected leak, OOM, RSS growing |
+| `/analyze-hang` | App stops responding / deadlock |
+| `/analyze-high-cpu` | CPU pegged, GC pressure suspected |
+| `/analyze-finalizer` | Finalizer queue long / blocked finalizer |
+| `/analyze-async` | Stuck `Task` / async state machine |
+| `/overview` | "Just show me what's in this dump" |
+
+These come from the MCP server's `prompts/list` — Claude Code surfaces them
+as autocompletions. Each one primes Claude with the matching playbook so
+you don't have to write the prompt yourself. Each also accepts a free-text
+`user_description` if you want to add context.
+
+Whichever option you pick, the rest is the same.
 
 ### Step 5 — What you'll see
 
@@ -313,18 +334,39 @@ Claude Code                                     │ lldb + SOS             │
 the target unless you use `--copy-dump` to push a local dump *into* a target.
 **Your source code never leaves your laptop** — Claude Code reads it locally.
 
-**MCP tool surface:**
+### MCP surface (what Claude sees)
 
-- `lldb_command` — run any single lldb / SOS command. The session is
-  stateful, so `thread select N` carries to subsequent calls.
-- `target_info` — describe the connected target (transport, lldb version,
-  dump path, whether `.lldbinit` loads SOS).
+The server advertises three MCP capabilities — `tools`, `resources`, and
+`prompts` (all with `listChanged: true`).
 
-That's the whole API the LLM sees. The MCP server's `initialize` response
-includes a detailed playbook (distilled from
-[Tess Ferrandez's .NET debugging labs](https://www.tessferrandez.com/postindex/))
-so the LLM knows the right SOS command sequence for crashes, hangs, memory
-issues, high CPU, finalizer problems, and async-stuck scenarios.
+**Tools** (2) — actions Claude can take:
+
+| Tool | Purpose |
+|---|---|
+| `lldb_command` | Run any single lldb / SOS command. The session is stateful, so `thread select N` carries to subsequent calls. |
+| `target_info` | Describe the connected target (transport, lldb version, dump path, whether `.lldbinit` loads SOS). |
+
+**Resources** (11) — state and playbooks Claude can read on demand:
+
+| URI | What it is |
+|---|---|
+| `netcore-lldb://playbook/crash` | Crash / unhandled-exception playbook |
+| `netcore-lldb://playbook/memory` | Memory / leak / OOM playbook |
+| `netcore-lldb://playbook/hang` | Hang / deadlock playbook (Tess's `syncblk` approach) |
+| `netcore-lldb://playbook/high-cpu` | High CPU / GC pressure playbook (the 80% rule, 100:10:1 ratio) |
+| `netcore-lldb://playbook/finalizer` | Finalizer-thread-stuck playbook |
+| `netcore-lldb://playbook/async` | Stuck async Task / state machine playbook |
+| `netcore-lldb://session` | Live: transport, lldb version, dump path (JSON) |
+| `netcore-lldb://modules` | Live: lazy `clrmodules -v` against the dump |
+| `netcore-lldb://threads` | Live: lazy `clrthreads` against the dump |
+| `netcore-lldb://heuristics` | Tess-named diagnostic tells (`MonitorHeld`, the 80% rule, etc.) |
+| `netcore-lldb://known-issues` | Workarounds for upstream SOS bugs (e.g. .NET 10 `gcroot` segfault) |
+
+**Prompts** (7) — `/`-completions for scenario kickoff (see Step 4 above).
+
+The playbooks are distilled from
+[Tess Ferrandez's .NET debugging labs](https://www.tessferrandez.com/postindex/) —
+the canonical reference for managed-dump analysis.
 
 ---
 
@@ -348,23 +390,26 @@ issues, high CPU, finalizer problems, and async-stuck scenarios.
 .
 ├── README.md
 ├── .gitignore
-├── client/                 # THE PRODUCT
-│   ├── netcore_lldb.py     # MCP client (single file, stdlib only)
-│   ├── netcore-lldb        # bash wrapper for PATH
-│   └── netcore-lldb.cmd    # Windows wrapper
-├── reference-image/        # optional sandbox image (only for testing this tool)
+├── .github/
+│   └── workflows/
+│       └── publish-image.yml   # auto-publish reference image to ghcr.io on v* tags
+├── client/                     # THE PRODUCT
+│   ├── netcore_lldb.py         # MCP client (single file, stdlib only)
+│   ├── netcore-lldb            # bash wrapper for PATH
+│   └── netcore-lldb.cmd        # Windows wrapper
+├── reference-image/            # optional sandbox image (published to ghcr.io)
 │   ├── Dockerfile
 │   └── README.md
-├── sample/                 # tiny crashing .NET 10 app for self-testing
+├── sample/                     # tiny crashing .NET 10 app for self-testing
 │   ├── Crasher.csproj
 │   └── Program.cs
-└── tests/                  # comprehensive end-to-end test suite
-    ├── run_all.py          # 57 MCP-protocol-level tests (docker + ssh transports)
-    ├── fixtures/           # curated .NET fixture apps (memory leak, deadlock, event-handler leak)
+└── tests/                      # comprehensive end-to-end test suite
+    ├── run_all.py              # 68 MCP-protocol-level tests (docker + ssh transports)
+    ├── fixtures/               # curated .NET fixture apps (memory leak, deadlock, event-handler leak)
     │   └── build-and-dump.sh
-    ├── setup-sshd.sh       # one-time: enable sshd on WSL for SSH tests
-    ├── build-image.sh      # one-time: docker build of the reference image
-    └── install-docker.sh   # one-time: install Docker CE on Ubuntu WSL
+    ├── setup-sshd.sh           # one-time: enable sshd on WSL for SSH tests
+    ├── build-image.sh          # one-time: docker build of the reference image
+    └── install-docker.sh       # one-time: install Docker CE on Ubuntu WSL
 ```
 
 ## Building from source / development
@@ -379,12 +424,31 @@ If you're modifying the tool itself:
 # build the fixture dumps used by tests
 ./tests/fixtures/build-and-dump.sh
 
-# run the full test suite (57 tests, docker + ssh transports)
+# run the full test suite (68 tests, docker + ssh transports)
 python3 tests/run_all.py
 ```
 
-The test suite covers: argument parsing, preflight, MCP protocol, every
-shipped SOS command, stateful sessions, large output, the bash wrapper,
-`--copy-dump`, `--bootstrap` (both fresh and idempotent), and three curated
-fixture dumps that exercise the canonical memory-leak / deadlock /
-event-handler-leak playbooks.
+The test suite covers:
+
+- **Argument parsing** — `--docker`/`--ssh` mutual exclusion, missing flags, `--help`, unknown args.
+- **Preflight** — unreachable container/host, target missing lldb, missing dump.
+- **MCP protocol** — `initialize` (with all three capabilities), `tools/list`, `tools/call`, `resources/list`, `resources/read` (static + dynamic + error paths), `prompts/list`, `prompts/get` (with and without `user_description`), `ping`, `shutdown`, unknown method.
+- **SOS commands** — every shipped command (`eeversion`, `clrthreads`, `pe`, `clrstack`, `clrstack -a`, `clrstack -all`, `clrmodules`, `dumpheap -stat`, `dso`, `eeheap -gc`, `threadpool`, `dumpasync`, `gcheapstat`) — verifies coherent SOS responses.
+- **Stateful session** — `thread select` carries to subsequent `clrstack`.
+- **Large output** — `dumpheap -stat` (~15 KB) doesn't break prompt detection.
+- **Concurrent calls** — 8 rapid tool calls roundtrip without tangling.
+- **Wrapper invocation** — `client/netcore-lldb` launches the python script correctly.
+- **`--copy-dump`** — local-to-target dump copy with default and explicit `--target-dump-path`.
+- **`--bootstrap`** — fresh install on a bare target AND idempotent fast-path on an already-set-up target.
+- **Fixture playbooks** — three curated dumps (memory leak, deadlock, event-handler leak) verify each Tess playbook end-to-end.
+
+## Releases
+
+Each `v*` git tag triggers
+[`.github/workflows/publish-image.yml`](.github/workflows/publish-image.yml),
+which builds `reference-image/Dockerfile` and pushes it to
+`ghcr.io/cadneowl/netcore-lldb:<version>` and `:latest`. Anonymous pulls
+work — the package is public.
+
+Current release: **v0.3.0** (client tool v0.3.0, reference image
+`ghcr.io/cadneowl/netcore-lldb:v0.3.0`).
