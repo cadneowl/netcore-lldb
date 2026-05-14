@@ -260,6 +260,26 @@ MCP server for Claude Code. Internally it spawns `lldb` on the target via
 either `docker exec` or `ssh`, drives it for the duration of the session, and
 exposes two tools to the LLM: `lldb_command` and `target_info`.
 
+### Why not use LLDB's built-in MCP server?
+
+LLDB has [native MCP support](https://lldb.llvm.org/use/mcp.html) starting
+in version **21** (`protocol-server start MCP listen://localhost:59999`). We
+deliberately don't use it (yet) for two reasons:
+
+1. **Compatibility.** Every default `apt install lldb` on Debian/Ubuntu LTS
+   today gives you lldb 18–20, neither of which has `protocol-server`. To
+   use the built-in server we'd require customers to add `apt.llvm.org` and
+   install `lldb-21`+. The subprocess approach works against any lldb ≥ 18.
+2. **Transport.** LLDB's native MCP is a TCP listener (`localhost:59999`).
+   Claude Code speaks stdio MCP. Bridging from stdio to a TCP socket *inside
+   a remote docker container* over `docker exec` or `ssh` is doable but adds
+   moving parts. The subprocess approach hands stdio MCP to Claude Code
+   directly.
+
+When lldb 21+ becomes the default on common distros, we'll likely add an
+alternative `--use-native-mcp` mode that does exactly that bridge for users
+who prefer it.
+
 ```
 [Your laptop]                                  [Target — anywhere]
                                                 ┌────────────────────────┐
